@@ -237,7 +237,7 @@ If you see "Permission denied" when running NullWord after install, set the perm
 
     sudo chmod 755 /usr/local/bin/NullWord
 
-If you see an Argon2 error, try closing other programs to free up memory. If you continue to see errors, you can lower the Argon2 memory settings in the source code.
+If you see an Argon2 error, try closing other programs to free up memory. If you continue to see errors, NullWord probably isn't a good fit for your system. Note that, in principle, you can lower the Argon2 memory settings in the source code - BUT, this is strongly discouraged, because if you lose the custom parameters, you'll be unable to recover your passwords.
 
 If you enter "logout" as the service name, your salt/pepper credentials will be deleted and you'll be prompted to set them up again next time.
 
@@ -255,7 +255,9 @@ Security Reminders
   
   - If you ever do need to change parameters in nullword.c (NOT RECOMMENDED!), write them down and keep them with your backup.
 
-  - Passwords are never stored on your computer—each one is generated only when you ask for it.
+  - Passwords are never stored on your block storage devices (SSD, HD, etc.)—each one is generated only when you ask for it, and lives only in memory. To maximize the benefits of this, consider enabling "swap with session-based encryption" (Google it).
+
+  - NullWord is best kept separate from other, potentially compromised software you might be running. Consider using a hypervisor-based operating system like QubesOS if security matters to you.
 
 --------------------------------------
 
