@@ -9,96 +9,151 @@
 #include <errno.h>
 #include <ctype.h>
 
-#define HASHLEN      32
-#define FINALPWLEN   16
-#define DELIM        "::::::::::"
-#define BASE36LEN    50
-#define CREDS_PATH   "/.nullword/creds.txt"
-#define MAXNAME      64  // max allowed for first/last name (alphabetics only)
-#define MAXSERVICE   64  // max allowed for service name
-#define MAXPASS      64  // max allowed for master password
+#define HASHLEN        32
+#define FINALPWLEN     16
+#define DELIM          "::::::::::"
+#define BASE36LEN      50
+#define CREDS_PATH     "/.zeropass/creds.txt"
+#define MAXNAME        64    // for first/last name
+#define MAXSERVICE     64    // for service name
+#define MAXPASS        64    // for master password
 
-// Helper: copy only alphabetics, convert to lowercase, up to MAXNAME
-void sanitize_name(char *dest, const char *src) {
+// Argon2id parameters as macros
+#define ARGON2_T_COST  2
+#define ARGON2_M_COST  1126400
+#define ARGON2_P_COST  5
+
+// Helper: Copy only alphabetics, convert to lowercase, up to maxlen
+void sanitize_alpha_lower(char *dest, const char *src, size_t maxlen) {
     size_t di = 0;
-    for (size_t si = 0; src[si] && di < MAXNAME; ++si) {
-        if (isalpha((unsigned char)src[si])) {
+    for (size_t si = 0; src[si] && di < maxlen; ++si) {
+        if (isalpha((unsigned char)src[si]) && ((unsigned char)src[si]) < 128) {
             dest[di++] = tolower((unsigned char)src[si]);
         }
     }
     dest[di] = 0;
 }
 
-// Reads input (line), applies sanitize_name, checks for overflow
-void get_sanitized_input(const char *prompt, char *buf) {
-    char tmp[MAXNAME * 4 + 2]; // allow very large input for filtering
-    printf("%s", prompt);
-    fflush(stdout);
-
-    if (!fgets(tmp, sizeof(tmp), stdin)) tmp[0] = 0;
-    size_t len = strlen(tmp);
-    if (len && tmp[len-1] == '\n') tmp[len-1] = 0;
-
-    // Did input overflow buffer? (missing newline at end, buffer full)
-    if (len == sizeof(tmp)-1 && tmp[len-1] != '\n') {
-        fprintf(stderr, "Input too long (more than %d chars)!\n", MAXNAME);
-        exit(1);
-    }
-
-    sanitize_name(buf, tmp);
-    if (strlen(buf) > MAXNAME) {
-        fprintf(stderr, "Sanitized name too long! (max %d alphabetic characters)\n", MAXNAME);
-        exit(1);
-    }
-}
-
-// General input: checks for true overflow (no silent truncation!)
-void get_checked_input(const char *prompt, char *buf, size_t maxlen) {
-    char tmp[maxlen+2];
-    printf("%s", prompt);
-    fflush(stdout);
-
-    if (!fgets(tmp, sizeof(tmp), stdin)) tmp[0] = 0;
-    size_t len = strlen(tmp);
-    if (len && tmp[len-1] == '\n') tmp[len-1] = 0;
-
-    // Overflow check: did we fill tmp without newline?
-    if (len == sizeof(tmp)-1 && tmp[len-1] != '\n') {
-        fprintf(stderr, "Input too long! (max %zu characters allowed)\n", maxlen);
-        exit(1);
-    }
-    if (strlen(tmp) > maxlen) {
-        fprintf(stderr, "Input too long! (max %zu characters allowed)\n", maxlen);
-        exit(1);
-    }
-    strcpy(buf, tmp);
-}
-
-void get_hidden_input(const char *prompt, char *buf, size_t maxlen) {
-    char tmp[maxlen+2];
+// Line editor for all fields (mask=1 for password, 0 for normal fields)
+void read_line(const char *prompt, char *buf, size_t maxlen, int mask, int sanitize) {
     struct termios oldt, newt;
     printf("%s", prompt);
     fflush(stdout);
     tcgetattr(STDIN_FILENO, &oldt);
     newt = oldt;
-    newt.c_lflag &= ~(ECHO);
+    newt.c_lflag &= ~(ICANON | ECHO); // raw mode, no echo
     tcsetattr(STDIN_FILENO, TCSANOW, &newt);
-    if (!fgets(tmp, sizeof(tmp), stdin)) tmp[0] = 0;
+
+    char input[maxlen+2];
+    size_t len = 0, pos = 0;
+    input[0] = 0;
+
+    while (1) {
+        int c = getchar();
+
+        // ENTER key
+        if (c == '\n' || c == '\r') {
+            break;
+        }
+
+        // Handle arrow keys
+        if (c == 27) { // ESC
+            int c2 = getchar();
+            if (c2 == '[') {
+                int c3 = getchar();
+                // Left Arrow
+                if (c3 == 'D' && pos > 0) {
+                    printf("\033[1D");
+                    fflush(stdout);
+                    pos--;
+                }
+                // Right Arrow
+                else if (c3 == 'C' && pos < len) {
+                    printf("\033[1C");
+                    fflush(stdout);
+                    pos++;
+                }
+                continue;
+            }
+        }
+        // Backspace (127 or 8)
+        if ((c == 127 || c == 8) && pos > 0) {
+            memmove(&input[pos-1], &input[pos], len-pos+1);
+            len--;
+            pos--;
+            printf("\033[1D");
+            printf("\033[s"); // save cursor
+            if (mask) {
+                for (size_t i = pos; i < len; ++i)
+                    putchar('*');
+            } else {
+                for (size_t i = pos; i < len; ++i)
+                    putchar(input[i]);
+            }
+            putchar(' ');
+            printf("\033[u"); // restore cursor
+            fflush(stdout);
+            continue;
+        }
+        // Insert char (print * if mask)
+        if ((unsigned char)c >= 32 && (unsigned char)c <= 126 && len < maxlen) {
+            memmove(&input[pos+1], &input[pos], len-pos+1);
+            input[pos] = c;
+            len++;
+            printf("\033[s"); // save cursor
+            if (mask) {
+                for (size_t i = pos; i < len; ++i)
+                    putchar('*');
+            } else {
+                for (size_t i = pos; i < len; ++i)
+                    putchar(input[i]);
+            }
+            putchar(' ');
+            printf("\033[u"); // restore cursor
+            printf("\033[1C");
+            fflush(stdout);
+            pos++;
+        }
+    }
+
+    input[len] = 0;
     tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
     printf("\n");
-    size_t len = strlen(tmp);
-    if (len && tmp[len-1] == '\n') tmp[len-1] = 0;
 
-    // Overflow check: did we fill tmp without newline?
-    if (len == sizeof(tmp)-1 && tmp[len-1] != '\n') {
+    // Sanitization step if needed
+    if (sanitize) {
+        sanitize_alpha_lower(buf, input, maxlen);
+    } else {
+        strncpy(buf, input, maxlen);
+        buf[maxlen] = 0;
+    }
+}
+
+// Reads sanitized name field (mask=0)
+void get_sanitized_input(const char *prompt, char *buf, size_t maxlen) {
+    read_line(prompt, buf, maxlen, 0, 1);
+    if (strlen(buf) > maxlen) {
+        fprintf(stderr, "Sanitized input too long! (max %zu alphabetic characters)\n", maxlen);
+        exit(1);
+    }
+}
+
+// Reads service name (mask=0, sanitizes to alpha lowercase)
+void get_sanitized_service(const char *prompt, char *buf, size_t maxlen) {
+    read_line(prompt, buf, maxlen, 0, 1);
+    if (strlen(buf) > maxlen) {
+        fprintf(stderr, "Sanitized service name too long! (max %zu alphabetic characters)\n", maxlen);
+        exit(1);
+    }
+}
+
+// Reads password (mask=1), no sanitization
+void get_hidden_input(const char *prompt, char *buf, size_t maxlen) {
+    read_line(prompt, buf, maxlen, 1, 0);
+    if (strlen(buf) > maxlen) {
         fprintf(stderr, "Password too long! (max %zu characters allowed)\n", maxlen);
         exit(1);
     }
-    if (strlen(tmp) > maxlen) {
-        fprintf(stderr, "Password too long! (max %zu characters allowed)\n", maxlen);
-        exit(1);
-    }
-    strcpy(buf, tmp);
 }
 
 void base36_tailN(const unsigned char *in, char *out, int outlen) {
@@ -133,9 +188,9 @@ int try_clipboard(const char *cmd, const char *text) {
     return 1;
 }
 
-int ensure_nullword_dir() {
+int ensure_zeropass_dir() {
     char path[1024];
-    snprintf(path, sizeof(path), "%s/.nullword", getenv("HOME"));
+    snprintf(path, sizeof(path), "%s/.zeropass", getenv("HOME"));
     struct stat st;
     if (stat(path, &st) == -1) {
         if (mkdir(path, 0700) == -1) {
@@ -167,16 +222,16 @@ int main() {
 
     FILE *cf = fopen(credsfile, "r");
     if (!cf) {
-        printf("Welcome to NullWord!\n");
+        printf("Welcome to ZeroPass!\n");
         printf("Please enter your first and last name below.\n");
         printf("NOTE: These are used as salt and pepper, and never transmitted over the internet.\n");
         printf("NOTE: They can be fake names, but you have to be consistent.\n");
         printf("NOTE: Both are stored as plaintext in %s\n", credsfile);
-        printf("NOTE: Only alphabetical characters (A-Z, a-z) will be kept, and all will be converted to lowercase. All other characters will be stripped.\n");
-        get_sanitized_input("First name (used as salt): ", firstname);
-        get_sanitized_input("Last name (used as pepper): ", lastname);
+        printf("NOTE: Only A-Z and a-z will be kept for names and service names (all will be lowercased, all else stripped).\n");
+        get_sanitized_input("First name (used as salt): ", firstname, MAXNAME);
+        get_sanitized_input("Last name (used as pepper): ", lastname, MAXNAME);
 
-        if (ensure_nullword_dir() != 0) return 2;
+        if (ensure_zeropass_dir() != 0) return 2;
 
         cf = fopen(credsfile, "w");
         if (!cf) { fprintf(stderr, "Failed to save %s\n", credsfile); return 2; }
@@ -185,7 +240,6 @@ int main() {
 
         printf("Thanks, %s! Your chosen names are now stored in %s\n", firstname, credsfile);
     } else {
-        // Defensive read: refuse lines that are too long
         if (!fgets(firstname, sizeof(firstname), cf)) return 3;
         if (strchr(firstname, '\n') == NULL && !feof(cf)) {
             fprintf(stderr, "Credentials file corrupt: first name too long.\n");
@@ -207,37 +261,32 @@ int main() {
     char service[MAXSERVICE+1];
     char master[MAXPASS+1];
 
-    // Service name (input check)
-    get_checked_input("Service name: ", service, MAXSERVICE);
+    get_sanitized_service("Service name: ", service, MAXSERVICE);
 
-    // Handle logout
     if (strcmp(service, "logout") == 0) {
         return delete_creds(credsfile);
     }
 
     get_hidden_input("Master password: ", master, MAXPASS);
 
-    // Build input (all buffers are sized for safety)
     char combined[1024] = {0};
     size_t combolen = strlen(firstname) + strlen(lastname) + strlen(service) + strlen(master) + 3*strlen(DELIM);
     if (combolen >= sizeof(combined)) {
         fprintf(stderr, "Combined input too long! Please use shorter inputs.\n");
         return 1;
-    }
+    }    
     snprintf(combined, sizeof(combined), "%s%s%s%s%s%s%s",
         firstname, DELIM, lastname, DELIM, service, DELIM, master);
 
-    uint32_t t_cost = 2;
-    uint32_t m_cost = 1126400;
-    uint32_t parallelism = 5;
-    const char salt[9] = "00000000";
-    size_t saltlen = 8;
+    printf("Hashing: please wait...\n");
+    fflush(stdout);
+
     unsigned char hash[HASHLEN];
 
     int rc = argon2id_hash_raw(
-        t_cost, m_cost, parallelism,
+        ARGON2_T_COST, ARGON2_M_COST, ARGON2_P_COST,
         combined, strlen(combined),
-        salt, saltlen,
+        "00000000", 8,
         hash, HASHLEN);
 
     if (rc != ARGON2_OK) {
@@ -264,7 +313,7 @@ int main() {
     } else {
         printf("Could not copy password to clipboard.\n");
         printf("Please install xclip, xsel, or wl-clipboard to enable clipboard copy.\n");
-        printf("For your security, nullword will never print your password to the terminal.\n");
+        printf("For your security, zeropass will never print your password to the terminal.\n");
     }
 
     memset(master, 0, sizeof(master));
