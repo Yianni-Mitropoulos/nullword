@@ -59,21 +59,17 @@ Installing On Fedora
 
     tar xvf NullWord.tar.gz
 
-  This will create a folder containing the files NullWord.c and Makefile.
+  This will create a folder containing the files nullword.c and Makefile.
 
 4. Build and install NullWord:
 
-  Open a terminal in the folder that contains NullWord.c and Makefile, then run:
-
-    make
-
-  After the build completes, install NullWord for all users with:
+  Install NullWord for all users with:
 
     sudo make install
 
   Now you can run NullWord from any terminal window by typing:
 
-    NullWord
+    nullword
 
 --------------------------------------
 
@@ -115,15 +111,11 @@ Installing On Debian
 
     tar xvf NullWord.tar.gz
 
-  This will create a folder containing the files NullWord.c and Makefile.
+  This will create a folder containing the files nullword.c and Makefile.
 
 4. Build and install NullWord:
 
-  Open a terminal in the folder that contains NullWord.c and Makefile, then run:
-
-    make
-
-  After the build completes, install NullWord for all users with:
+  Install NullWord for all users with:
 
     sudo make install
 
@@ -260,9 +252,9 @@ Security Reminders
 
   - It's OK to write your password and/or poem on paper while you memorise it. But be sure to dispose of the paper effectively. For example: tear into parts, put different parts in different bins in different suburbs at different times, etc.
 
-  - It's probably better not to modify the parameters inside NullWord.c. If you lose your custom parameters, you'll lose access to your passwords. The defaults are fine, just use those.
+  - It's probably better not to modify the parameters inside nullword.c. If you lose your custom parameters, you'll lose access to your passwords. The defaults are fine, just use those.
   
-  - If you ever do need to change parameters in NullWord.c (NOT RECOMMENDED!), write them down and keep them with your backup.
+  - If you ever do need to change parameters in nullword.c (NOT RECOMMENDED!), write them down and keep them with your backup.
 
   - Passwords are never stored on your computer—each one is generated only when you ask for it.
 
