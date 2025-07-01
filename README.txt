@@ -10,10 +10,9 @@ Purpose
 
   This means you only need to memorise one password.
   
-  You're also not depending on a 3rd party password manager, making the system trustless.
+  You're also not depending on an external server or centralized password repository, making the system trustless.
 
-  NullWord uses a world-class memory-hard password hashing algorithm (Argon2id) with settings designed to stay secure well into the future. 
-  On a modern computer, it takes about half a second to a second to generate your password. This is by design: the cost to attackers increases as computers get faster, but for you it's still fast enough.
+  Note that NullWord uses the Argon2id password hashing algorithm with prohibitively slow settings. This should help it remain secure well into the future. Unfortunately, this also means that on a typical computer from 2025, it takes a bit under half a second to generate your password. This is by design: the cost to attackers increases as computers get faster, but for you it's still fast enough.
 
 --------------------------------------
 
