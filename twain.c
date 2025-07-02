@@ -1,4 +1,20 @@
-// twain.c - TwainPass: Deterministic password manager (production ready)
+// twain.c - TwainPass: Deterministic Password Manager (Production Build)
+//
+// Features:
+//  - Deterministic password derivation from name, passphrase, master password, and service name
+//  - Zero-knowledge: no master password or passphrase is ever stored in plaintext
+//  - Service-name password copy, clipboard auto-clear (with "twain-clip" helper)
+//  - Export ("creds-view") and permanent wipe ("creds-delete") of credentials
+//  - Strong UTF-8 and edit support for names/services, strong error checking everywhere
+//  - Robust secure memory erasure and secure exit handling
+//
+// Credentials file layout:
+//   first_name \n AES(passphrase \n pepper)
+//   - AES key = Argon2id(master_password, salt=first_name_padded, params=strong)
+//   - IV      = first_name padded to 16 bytes (AES block size)
+//   - pepper  = PEPPER_MAGIC (32 x's) + Argon2id(passphrase || DELIM || master_password, brutal params)
+//   - DELIM   = "::::::::::" (10 colons, safe in UTF-8, never typed by user)
+
 #define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
 #include <string.h>
@@ -19,30 +35,33 @@
 #include <signal.h>
 #include <sys/wait.h>
 
+// ==== CONFIGURABLE CONSTANTS ====
+
 #define VERSION        "TwainPass v1.0"
-#define HASHLEN        32
-#define FINALPWLEN     16
-#define DELIM          "::::::::::"
+#define HASHLEN        32         // bytes output by Argon2id and SHA3-256
+#define FINALPWLEN     16         // length of final output password (base36)
+#define DELIM          "::::::::::" // Delimiter for hashing, never input by user
 #define DIRNAME        ".twain"
 #define FILENAME       "creds.txt"
-#define MAXNAME        16     // for first name (UTF-8 bytes, not chars; 16 bytes to fit AES IV)
-#define MAXPASS        64     // for master password (UTF-8 bytes)
-#define MINPASS        16     // min password bytes
-#define MAXPHRASE      512    // for passphrase (UTF-8 bytes)
-#define MINPHRASE      3      // min passphrase bytes
-#define AES_KEYLEN     32
-#define AES_IVLEN      16
-#define ARGON2_T_COST_NORMAL 2
-#define ARGON2_T_COST_BRUTAL 64
-#define ARGON2_M_COST  1126400
-#define ARGON2_P_COST  5
+#define MAXNAME        16         // first name, max 16 bytes (UTF-8), fits AES IV (128-bit)
+#define MAXPASS        64         // master password max bytes (UTF-8)
+#define MINPASS        16         // min password length (security)
+#define MAXPHRASE      512        // passphrase max bytes (UTF-8)
+#define MINPHRASE      3          // min passphrase length
+#define AES_KEYLEN     32         // 256-bit AES
+#define AES_IVLEN      16         // 128-bit IV
+#define ARGON2_T_COST_NORMAL 2    // Argon2id "normal" time cost
+#define ARGON2_T_COST_BRUTAL 64   // Argon2id "brutal" time cost
+#define ARGON2_M_COST  1126400    // Argon2id memory cost (bytes/1024 = KiB)
+#define ARGON2_P_COST  5          // Argon2id parallelism (threads)
 
+// "Pepper" is 32 x's (magic), then 32-byte Argon2id hash (so 64 bytes total)
 #define PEPPER_MAGIC   "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 #define PEPPER_MAGIC_LEN (sizeof(PEPPER_MAGIC)-1)
 #define PEPPER_LEN (PEPPER_MAGIC_LEN + HASHLEN)
 
 #define BADCHAR_WARNING "\
-| WARNING\n\
+WARNINGS\n\
 | 1. Your input contains capital letters, whitespace, or other fancy characters.\n\
 | 2. We therefore recommend restarting the process from the beginning.\n\
 | 3. We'll use your input as-is, without sanitizing it.\n\
@@ -50,12 +69,14 @@
 |    This is because you'll need to type the exact same names again in the future.\n\
 |    Fancy characters can lead to frustration further down the track.\n"
 
-// -------- Secure Data Wipe & Abort --------
+// ==== SECURE MEMORY WIPE & EXIT STRATEGY ====
+
 void secure_memzero(void *v, size_t n) {
     volatile unsigned char *p = (volatile unsigned char *)v;
     while (n--) *p++ = 0;
 }
 
+// Always use secure_bail for any exit/quit/error to guarantee zeroing secrets
 void secure_bail(int code,
     unsigned char *a, size_t alen,
     unsigned char *b, size_t blen,
@@ -77,7 +98,9 @@ void secure_bail_simple(int code) {
     exit(code);
 }
 
-// Returns 1 if str contains uppercase, whitespace, or punctuation
+// ==== INPUT VALIDATION & UTF-8 FRIENDLY INTERACTIVE INPUT ====
+
+// Returns 1 if string contains uppercase, whitespace, or non-alphanum ASCII
 int has_bad_char(const char *str, size_t len) {
     int found = 0;
     for (size_t i = 0; i < len;) {
@@ -86,6 +109,7 @@ int has_bad_char(const char *str, size_t len) {
             if (isupper(c) || isspace(c) || (!isalpha(c) && !isdigit(c))) found = 1;
             ++i;
         } else {
+            // Accept all multibyte UTF-8
             if ((c & 0xE0) == 0xC0) i += 2;
             else if ((c & 0xF0) == 0xE0) i += 3;
             else if ((c & 0xF8) == 0xF0) i += 4;
@@ -95,8 +119,8 @@ int has_bad_char(const char *str, size_t len) {
     return found;
 }
 
-// Returns length in bytes. Sets *out_num_chars if non-NULL.
-// mask==1: hide input (no stars/cursor), else: full live editing with UTF-8 support.
+// Reads an input line with full UTF-8/cursor/edit support. (mask==1: hidden, mask==0: live edit)
+// For masked: no echo at all (cursor appears stationary), for non-masked: full cursor.
 size_t read_line(const char *prompt, unsigned char *buf, size_t maxlen, int mask, size_t *out_num_chars) {
     struct termios oldt, newt;
     printf("%s", prompt);
@@ -112,21 +136,17 @@ size_t read_line(const char *prompt, unsigned char *buf, size_t maxlen, int mask
 
     while (1) {
         int c = getchar();
-        // ENTER
         if (c == '\n' || c == '\r') break;
 
-        // Arrow keys
         if (c == 27) {
             int c2 = getchar();
             if (c2 == '[') {
                 int c3 = getchar();
                 if (!mask) {
-                    // Left
                     if (c3 == 'D' && pos > 0) {
                         do { pos--; } while (pos > 0 && ((input[pos] & 0xC0) == 0x80));
                         printf("\033[1D"); fflush(stdout);
                     }
-                    // Right
                     else if (c3 == 'C' && pos < len) {
                         size_t next = pos+1;
                         while (next < len && (input[next] & 0xC0) == 0x80) ++next;
@@ -135,7 +155,6 @@ size_t read_line(const char *prompt, unsigned char *buf, size_t maxlen, int mask
                             pos = next;
                         }
                     }
-                    // Delete: ESC [ 3 ~
                     else if (c3 == '3') {
                         (void)getchar(); // '~'
                         if (pos < len) {
@@ -145,7 +164,6 @@ size_t read_line(const char *prompt, unsigned char *buf, size_t maxlen, int mask
                             else if ((input[pos] & 0xF8) == 0xF0) delbytes = 4;
                             memmove(&input[pos], &input[pos + delbytes], len - pos - delbytes + 1);
                             len -= delbytes;
-                            // Redraw after cursor
                             printf("\033[s");
                             for (size_t i = pos; i < len;) {
                                 int clen = 1;
@@ -165,7 +183,6 @@ size_t read_line(const char *prompt, unsigned char *buf, size_t maxlen, int mask
             }
         }
 
-        // Backspace (127 or 8)
         if ((c == 127 || c == 8)) {
             if (pos == 0) continue;
             size_t orig = pos;
@@ -191,21 +208,18 @@ size_t read_line(const char *prompt, unsigned char *buf, size_t maxlen, int mask
             continue;
         }
 
-        // Insert char at position
         if ((unsigned char)c >= 32 && len + 4 < maxlen) {
             int cbytes = 1;
             if ((c & 0xE0) == 0xC0) cbytes = 2;
             else if ((c & 0xF0) == 0xE0) cbytes = 3;
             else if ((c & 0xF8) == 0xF0) cbytes = 4;
             if (len + cbytes >= maxlen) continue;
-            // move everything after cursor forward
             memmove(&input[pos + cbytes], &input[pos], len - pos + 1);
             input[pos] = c;
             for (int k = 1; k < cbytes; ++k)
                 input[pos + k] = getchar();
             len += cbytes;
             if (!mask) {
-                // Redraw everything after cursor
                 printf("\033[s");
                 for (size_t i = pos; i < len;) {
                     int clen = 1;
@@ -238,7 +252,8 @@ size_t read_line(const char *prompt, unsigned char *buf, size_t maxlen, int mask
     return len;
 }
 
-// AES-256-CBC encrypt. Returns ciphertext len or -1.
+// ==== CRYPTOGRAPHIC ROUTINES ====
+
 int aes256_cbc_encrypt(const unsigned char *key, const unsigned char *iv,
                        const unsigned char *plaintext, int plaintext_len,
                        unsigned char *ciphertext) {
@@ -263,7 +278,6 @@ int aes256_cbc_encrypt(const unsigned char *key, const unsigned char *iv,
     return ciphlen;
 }
 
-// AES-256-CBC decrypt. Returns plaintext len or -1.
 int aes256_cbc_decrypt(const unsigned char *key, const unsigned char *iv,
                        const unsigned char *ciphertext, int ciphertext_len,
                        unsigned char *plaintext) {
@@ -281,7 +295,7 @@ int aes256_cbc_decrypt(const unsigned char *key, const unsigned char *iv,
     ptlen = len;
     if (1 != EVP_DecryptFinal_ex(ctx, plaintext + len, &len)) {
         EVP_CIPHER_CTX_free(ctx);
-        return ptlen; // partial junk as requested
+        return ptlen;
     }
     ptlen += len;
     EVP_CIPHER_CTX_free(ctx);
@@ -311,6 +325,8 @@ int argon2id_hash_raw_params(
     return rc;
 }
 
+// ==== FILESYSTEM/CLIPBOARD UTILS ====
+
 int ensure_twain_dir(const char *dirpath) {
     struct stat st;
     if (stat(dirpath, &st) == -1) {
@@ -322,6 +338,17 @@ int ensure_twain_dir(const char *dirpath) {
     return 0;
 }
 
+// Convert binary to lower-case hex (for pepper digest backup)
+void to_hex(const unsigned char *in, size_t len, char *out) {
+    static const char *hex = "0123456789abcdef";
+    for (size_t i = 0; i < len; ++i) {
+        out[2*i] = hex[(in[i]>>4)&0xF];
+        out[2*i+1] = hex[in[i]&0xF];
+    }
+    out[2*len] = 0;
+}
+
+// Base36 (tail N chars) password encoding (guaranteed deterministic from hash)
 void base36_tailN(const unsigned char *in, char *out, int outlen) {
     unsigned char digits[HASHLEN+1] = {0};
     memcpy(digits+1, in, HASHLEN);
@@ -343,6 +370,7 @@ void base36_tailN(const unsigned char *in, char *out, int outlen) {
     out[outlen] = 0;
 }
 
+// Attempts to copy text to clipboard using multiple tools (xclip, xsel, wl-copy)
 int try_clipboard(const char *cmd, const char *text) {
     FILE *clip = popen(cmd, "w");
     if (!clip) return 0;
@@ -352,6 +380,7 @@ int try_clipboard(const char *cmd, const char *text) {
     return 1;
 }
 
+// Kills all running twain-clip clipboard-clear helper processes before new copy
 void kill_old_twain_clip() {
     pid_t pid = fork();
     if (pid == 0) {
@@ -363,6 +392,27 @@ void kill_old_twain_clip() {
     }
 }
 
+/**
+ * Find pointer to first newline '\n' in buf (of length buflen),
+ * but only if at least PEPPER_MAGIC_LEN bytes follow the newline and
+ * they match PEPPER_MAGIC exactly. Returns pointer to '\n', or NULL if not found/matching.
+ */
+char* find_newline_with_pepper_magic(unsigned char *buf, size_t buflen) {
+    for (size_t i = 0; i < buflen; ++i) {
+        if (buf[i] == '\n') {
+            // Check that enough bytes remain for PEPPER_MAGIC
+            if ((buflen - (i + 1)) >= PEPPER_MAGIC_LEN &&
+                memcmp(buf + i + 1, PEPPER_MAGIC, PEPPER_MAGIC_LEN) == 0) {
+                return (char*)buf + i; // pointer to '\n'
+            }
+            break; // Found newline, but no/invalid magic after
+        }
+    }
+    return NULL;
+}
+
+// ==== MAIN LOGIC: Setup, Normal use, creds-delete, creds-view ====
+
 int main() {
     setlocale(LC_ALL, "");
     ERR_load_crypto_strings();
@@ -370,9 +420,9 @@ int main() {
         VERSION, ARGON2_T_COST_NORMAL, ARGON2_T_COST_BRUTAL, ARGON2_M_COST, ARGON2_P_COST);
     printf("OpenSSL version: %s\n", OPENSSL_VERSION_TEXT);
 
+    // ---- Find or create credentials file ----
     const char *home = getenv("HOME");
     if (!home) { fprintf(stderr, "Could not find HOME environment variable.\n"); return 1; }
-
     char dirpath[1024], credsfile[1024];
     int dlen = snprintf(dirpath, sizeof(dirpath), "%s/%s", home, DIRNAME);
     if (dlen < 0 || (size_t)dlen >= sizeof(dirpath)) secure_bail_simple(1);
@@ -387,8 +437,9 @@ int main() {
 
     FILE *cf = fopen(credsfile, "rb");
     if (!cf) {
+        // ---- FIRST-TIME SETUP ----
         printf("Welcome to TwainPass. First-time setup.\n");
-        printf("| REMARKS\n");
+        printf("REMARKS\n");
         printf("| 1. These are used as salt and pepper, and never transmitted over the internet.\n");
         printf("| 2. They can be fake, but you have to be consistent.\n");
         printf("| 3. Both are stored in encrypted form in %s\n", credsfile);
@@ -396,6 +447,7 @@ int main() {
         size_t fn_len = read_line("First name (used as salt, max 16 chars): ", firstname, MAXNAME, 0, NULL);
         if (has_bad_char((char*)firstname, fn_len)) printf("%s", BADCHAR_WARNING);
 
+        // Passphrase entry/check
         size_t ph_len = 0;
         do {
             ph_len = read_line("Passphrase (this acts like a second password, and is stored encrypted on the hard disk): ", passphrase, MAXPHRASE, 1, NULL);
@@ -414,6 +466,7 @@ int main() {
             break;
         } while (1);
 
+        // Master password entry/check
         size_t pw_len = 0;
         do {
             pw_len = read_line("Master Password (never tell this to anyone, except a judge under court order): ", password, MAXPASS, 1, NULL);
@@ -433,8 +486,8 @@ int main() {
         } while (1);
 
         printf("\n");
-        printf("We're now deriving a pepper from your passphrase.\n");
-        printf("This pepper then encrypted with your password, and stored on the hard disk.\n");   
+        printf("We're now deriving a pepper from your firstname, passphrase, and password.\n");
+        printf("This pepper stored on your hard disk in encrypted form.\n");   
         printf("This may take 10-30 seconds on modern CPUs. On some older systems, it can take a minute or two.\n");
         printf("REMARKS\n");
         printf("| Your password is never stored.\n");
@@ -480,8 +533,15 @@ int main() {
 
         memcpy(aes_iv, fname_salt, AES_IVLEN);
 
-        unsigned char ciphertext[PEPPER_LEN + AES_IVLEN] = {0};
-        int ciphlen = aes256_cbc_encrypt(secret, aes_iv, pepper, PEPPER_LEN, ciphertext);
+        // File format: first name (EOL), then AES(passphrase EOL pepper)
+        unsigned char enc_input[MAXPHRASE+2+PEPPER_LEN] = {0};
+        size_t enc_len = 0;
+        memcpy(enc_input, passphrase, ph_len); enc_len += ph_len;
+        enc_input[enc_len++] = '\n';
+        memcpy(enc_input+enc_len, pepper, PEPPER_LEN); enc_len += PEPPER_LEN;
+
+        unsigned char ciphertext[enc_len + AES_IVLEN];
+        int ciphlen = aes256_cbc_encrypt(secret, aes_iv, enc_input, (int)enc_len, ciphertext);
         if (ciphlen < 0) {
             fprintf(stderr, "AES encryption failed.\n");
             ERR_print_errors_fp(stderr);
@@ -503,12 +563,13 @@ int main() {
         fclose(cf);
 
         printf("\n");
-        printf("Your first name (in plaintext) and pepper (in encrypted form) are now stored at %s\n", credsfile);
+        printf("Your first name (in plaintext) and encrypted passphrase/pepper are now stored at %s\n", credsfile);
         printf("Never tell your password or passphrase to anyone, except under court order.");
         secure_bail(0, secret, sizeof(secret), pepper, sizeof(pepper), password, sizeof(password), passphrase, sizeof(passphrase), NULL,0);
     }
 
-    // --- Main workflow ---
+    // ==== OPEN FILE, READ, and BEGIN MAIN MENU ====
+    if (cf) rewind(cf);
     unsigned char fname_file[MAXNAME+2] = {0};
     size_t fn_len = 0;
     if (!fgets((char*)fname_file, sizeof(fname_file), cf)) {
@@ -521,25 +582,25 @@ int main() {
     memcpy(fname_salt, fname_file, fn_len > MAXNAME ? MAXNAME : fn_len);
     memcpy(aes_iv, fname_salt, AES_IVLEN);
 
-    unsigned char ciphertext[PEPPER_LEN + AES_IVLEN] = {0};
+    unsigned char ciphertext[(MAXPHRASE+2+PEPPER_LEN) + AES_IVLEN] = {0};
     size_t ciphertext_len = fread(ciphertext, 1, sizeof(ciphertext), cf);
     fclose(cf);
 
-    unsigned char secret[HASHLEN] = {0};
-    unsigned char pepper_decrypted[PEPPER_LEN + 16] = {0};
-    int decrypted_len = 0;
     char service[128] = {0};
-
-    printf("Hey, welcome back to TwainPass.\n");
-    printf("| REMARKS\n");
+    {
+        char firstname[17];
+        memcpy(firstname, fname_file, fn_len);
+        printf("Hey %s! Welcome back to TwainPass.\n", firstname);
+    }
+    printf("REMARKS\n");
     printf("| 1. Your credentials file is stored at %s\n", credsfile);
-    printf("| 2. You can use a service name of 'logout' to delete your credentials file.\n\n");
+    printf("| 2. Use service name 'creds-delete' to permanently delete credentials and log out.\n");
+    printf("| 3. Use service name 'creds-view' to copy your passphrase and pepper digest for backup.\n\n");
 
     size_t service_len = read_line("Service name: ", (unsigned char*)service, sizeof(service)-1, 0, NULL);
-    if (has_bad_char(service, service_len)) printf("%s", BADCHAR_WARNING);
 
-    if (strcmp(service, "logout") == 0) {
-        memset(secret, 0, sizeof(secret));
+    // --- creds-delete (DESTROY ALL CREDENTIALS) ---
+    if (strcmp(service, "creds-delete") == 0) {
         memset(ciphertext, 0, sizeof(ciphertext));
         memset(fname_salt, 0, sizeof(fname_salt));
         memset(fname_file, 0, sizeof(fname_file));
@@ -550,12 +611,72 @@ int main() {
         secure_bail_simple(0);
     }
 
+    // --- creds-view (EXPORT RECOVERY DATA) ---
+    if (strcmp(service, "creds-view") == 0) {
+        unsigned char password_view[MAXPASS+1] = {0};
+        size_t pw_len = read_line("Master password (for creds-view): ", password_view, MAXPASS, 1, NULL);
+        if (pw_len < MINPASS) {
+            printf("Master password must be at least %d bytes. Aborting.\n", MINPASS);
+            secure_bail(2, password_view, sizeof(password_view), NULL,0, NULL,0, NULL,0, NULL,0);
+        }
+        unsigned char secret[HASHLEN] = {0};
+        { int rc = argon2id_hash_raw_params(
+            ARGON2_T_COST_NORMAL, ARGON2_M_COST, ARGON2_P_COST,
+            password_view, pw_len,
+            fname_salt, MAXNAME,
+            secret, HASHLEN,
+            "derive secret"
+        );
+        if (rc != ARGON2_OK) {
+            secure_bail(2, password_view, sizeof(password_view), secret, sizeof(secret), NULL,0, NULL,0, NULL,0);
+        }}
+        unsigned char decrypted[MAXPHRASE+2+PEPPER_LEN+8] = {0};
+        int decrypted_len = aes256_cbc_decrypt(secret, aes_iv, ciphertext, (int)ciphertext_len, decrypted);
+        if (decrypted_len < 0) decrypted_len = 0;
+        // Parse: passphrase (EOL), pepper (remainder)
+        char* newline = find_newline_with_pepper_magic(decrypted, decrypted_len);        
+        if (!newline) {
+            printf("Could not decrypt credentials file!\n");
+            secure_bail(2, password_view, sizeof(password_view), secret, sizeof(secret), decrypted, sizeof(decrypted), NULL,0, NULL,0);
+        }
+        size_t p_off = (size_t)(newline - (char*)decrypted) + 1;
+        size_t left = ((size_t)decrypted_len > p_off) ? (size_t)decrypted_len - p_off : 0;
+        char passphrase_out[MAXPHRASE+1] = {0};
+        memcpy(passphrase_out, decrypted, p_off-1);
+        passphrase_out[p_off-1] = 0;
+        char pepper_hex[2*PEPPER_LEN+1] = {0};
+        to_hex((unsigned char*)decrypted + p_off, left, pepper_hex);
+
+        char clipbuf[MAXPHRASE+2+2*PEPPER_LEN+128];
+        snprintf(clipbuf, sizeof(clipbuf), "Passphrase: %s\nPepper digest (hex): %s\n", passphrase_out, pepper_hex);
+
+        // KILL all twain-clip
+        kill_old_twain_clip();
+        int copied = 0;
+        copied = try_clipboard("xclip -selection clipboard 2>/dev/null", clipbuf);
+        if (!copied)
+            copied = try_clipboard("xsel --clipboard --input 2>/dev/null", clipbuf);
+        if (!copied)
+            copied = try_clipboard("wl-copy 2>/dev/null", clipbuf);
+        if (copied) {
+            printf("Credentials exported to clipboard. Paste them in a secure backup document.");
+        } else {
+            printf("Could not copy credentials to clipboard.\n");
+        }
+        secure_bail(0, password_view, sizeof(password_view), secret, sizeof(secret), decrypted, sizeof(decrypted), (unsigned char*)clipbuf, sizeof(clipbuf), NULL,0);
+    }
+
+    // ==== NORMAL SERVICE PASSWORD WORKFLOW ====
+    if (has_bad_char(service, service_len)) printf("%s", BADCHAR_WARNING);
+    unsigned char secret[HASHLEN] = {0};
+    unsigned char decrypted[MAXPHRASE+2+PEPPER_LEN+8] = {0};
+    int decrypted_len = 0;
     size_t pw_len = read_line("Master password: ", password, MAXPASS, 1, NULL);
+    printf("\n");
     if (pw_len < MINPASS) {
         printf("Master password must be at least %d bytes. Aborting.\n", MINPASS);
         secure_bail(2, password, sizeof(password), secret, sizeof(secret), NULL,0, NULL,0, NULL,0);
     }
-
     { int rc = argon2id_hash_raw_params(
         ARGON2_T_COST_NORMAL, ARGON2_M_COST, ARGON2_P_COST,
         password, pw_len,
@@ -567,22 +688,26 @@ int main() {
         secure_bail(2, password, sizeof(password), secret, sizeof(secret), NULL,0, NULL,0, NULL,0);
     }}
 
-    decrypted_len = aes256_cbc_decrypt(secret, aes_iv, ciphertext, ciphertext_len, pepper_decrypted);
+    decrypted_len = aes256_cbc_decrypt(secret, aes_iv, ciphertext, (int)ciphertext_len, decrypted);
     if (decrypted_len < 0) decrypted_len = 0;
 
-    if (!(decrypted_len == PEPPER_LEN && memcmp(pepper_decrypted, PEPPER_MAGIC, PEPPER_MAGIC_LEN) == 0))
-        printf("| WARNING: Could not verify master password. Output is still deterministic.\n");
+    // Find passphrase and pepper in decrypted blob
+    char* newline = find_newline_with_pepper_magic(decrypted, decrypted_len);        
+    if (!newline) {
+        printf("WARNING: Could not decrypt credentials files. Output is still deterministic.\n");
+    }
+    size_t p_off = newline ? (size_t)(newline - (char*)decrypted) + 1 : (size_t)decrypted_len;
+    size_t left = ((size_t)decrypted_len > p_off) ? (size_t)decrypted_len - p_off : 0;
 
-    // --- Compute FINAL PASSWORD using SHA3 ---
+    // ==== FINAL PASSWORD USING SHA3 ====
     unsigned char out_input[HASHLEN + sizeof(DELIM) + PEPPER_LEN + sizeof(DELIM) + 128] = {0};
     size_t off = 0;
     memcpy(out_input, secret, HASHLEN); off += HASHLEN;
     memcpy(out_input+off, DELIM, sizeof(DELIM)-1); off += sizeof(DELIM)-1;
-    memcpy(out_input+off, pepper_decrypted, decrypted_len); off += decrypted_len;
+    memcpy(out_input+off, decrypted + p_off, left); off += left;
     memcpy(out_input+off, DELIM, sizeof(DELIM)-1); off += sizeof(DELIM)-1;
     memcpy(out_input+off, service, service_len); off += service_len;
 
-    // SHA3-256 with salt: hash( salt || msg )
     EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
     unsigned char out_hash[HASHLEN] = {0};
     if (!mdctx || 1 != EVP_DigestInit_ex(mdctx, EVP_sha3_256(), NULL) ||
@@ -591,7 +716,7 @@ int main() {
         1 != EVP_DigestFinal_ex(mdctx, out_hash, NULL)) {
         fprintf(stderr, "SHA3 hash error!\n");
         EVP_MD_CTX_free(mdctx);
-        secure_bail(2, password, sizeof(password), secret, sizeof(secret), pepper_decrypted, sizeof(pepper_decrypted), NULL,0, NULL,0);
+        secure_bail(2, password, sizeof(password), secret, sizeof(secret), decrypted, sizeof(decrypted), NULL,0, NULL,0);
     }
     EVP_MD_CTX_free(mdctx);
 
@@ -608,7 +733,6 @@ int main() {
     if (!copied)
         copied = try_clipboard("wl-copy 2>/dev/null", outpw);
 
-    // Spawn clipboard clearer (twain-clip) if copy succeeded
     if (copied) {
         printf("Password copied to clipboard!\n");
         printf("If it's still lurking in the clipboard in 15 seconds, we'll clear the clipboard.\n");
@@ -628,6 +752,6 @@ int main() {
         printf("For your security, TwainPass will never print your password to the terminal.\n");
     }
 
-    secure_bail(0, secret, sizeof(secret), password, sizeof(password), pepper_decrypted, sizeof(pepper_decrypted), (unsigned char*)out_hash, sizeof(out_hash), (unsigned char*)outpw, sizeof(outpw));
+    secure_bail(0, secret, sizeof(secret), password, sizeof(password), decrypted, sizeof(decrypted), (unsigned char*)out_hash, sizeof(out_hash), (unsigned char*)outpw, sizeof(outpw));
     return 0;
 }
