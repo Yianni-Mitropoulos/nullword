@@ -15,7 +15,9 @@
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #include <openssl/err.h>
-#include <openssl/opensslv.h>
+#include <openssl/sha.h>
+#include <signal.h>
+#include <sys/wait.h>
 
 #define VERSION        "TwainPass v1.0"
 #define HASHLEN        32
@@ -25,7 +27,9 @@
 #define FILENAME       "creds.txt"
 #define MAXNAME        16     // for first name (UTF-8 bytes, not chars; 16 bytes to fit AES IV)
 #define MAXPASS        64     // for master password (UTF-8 bytes)
+#define MINPASS        16     // min password bytes
 #define MAXPHRASE      512    // for passphrase (UTF-8 bytes)
+#define MINPHRASE      3      // min passphrase bytes
 #define AES_KEYLEN     32
 #define AES_IVLEN      16
 #define ARGON2_T_COST_NORMAL 2
@@ -33,7 +37,7 @@
 #define ARGON2_M_COST  1126400
 #define ARGON2_P_COST  5
 
-#define PEPPER_MAGIC   "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" // 32 x's
+#define PEPPER_MAGIC   "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 #define PEPPER_MAGIC_LEN (sizeof(PEPPER_MAGIC)-1)
 #define PEPPER_LEN (PEPPER_MAGIC_LEN + HASHLEN)
 
@@ -46,10 +50,31 @@
 |    This is because you'll need to type the exact same names again in the future.\n\
 |    Fancy characters can lead to frustration further down the track.\n"
 
-// Securely zero memory
+// -------- Secure Data Wipe & Abort --------
 void secure_memzero(void *v, size_t n) {
     volatile unsigned char *p = (volatile unsigned char *)v;
     while (n--) *p++ = 0;
+}
+
+void secure_bail(int code,
+    unsigned char *a, size_t alen,
+    unsigned char *b, size_t blen,
+    unsigned char *c, size_t clen,
+    unsigned char *d, size_t dlen,
+    unsigned char *e, size_t elen)
+{
+    if (a && alen) secure_memzero(a, alen);
+    if (b && blen) secure_memzero(b, blen);
+    if (c && clen) secure_memzero(c, clen);
+    if (d && dlen) secure_memzero(d, dlen);
+    if (e && elen) secure_memzero(e, elen);
+    printf("\n");
+    exit(code);
+}
+
+void secure_bail_simple(int code) {
+    printf("\n");
+    exit(code);
 }
 
 // Returns 1 if str contains uppercase, whitespace, or punctuation
@@ -61,7 +86,6 @@ int has_bad_char(const char *str, size_t len) {
             if (isupper(c) || isspace(c) || (!isalpha(c) && !isdigit(c))) found = 1;
             ++i;
         } else {
-            // Accept all multibyte UTF-8
             if ((c & 0xE0) == 0xC0) i += 2;
             else if ((c & 0xF0) == 0xE0) i += 3;
             else if ((c & 0xF8) == 0xF0) i += 4;
@@ -72,6 +96,7 @@ int has_bad_char(const char *str, size_t len) {
 }
 
 // Returns length in bytes. Sets *out_num_chars if non-NULL.
+// mask==1: hide input (no stars/cursor), else: full live editing with UTF-8 support.
 size_t read_line(const char *prompt, unsigned char *buf, size_t maxlen, int mask, size_t *out_num_chars) {
     struct termios oldt, newt;
     printf("%s", prompt);
@@ -82,66 +107,58 @@ size_t read_line(const char *prompt, unsigned char *buf, size_t maxlen, int mask
     tcsetattr(STDIN_FILENO, TCSANOW, &newt);
 
     size_t len = 0, pos = 0, num_chars = 0;
-    unsigned char input[maxlen + 8]; // Room for utf-8 safety
+    unsigned char input[maxlen + 8];
     input[0] = 0;
 
     while (1) {
         int c = getchar();
-
         // ENTER
         if (c == '\n' || c == '\r') break;
 
-        // Arrow keys: left/right (optional, very basic, only move cursor)
-        if (c == 27) { // ESC
+        // Arrow keys
+        if (c == 27) {
             int c2 = getchar();
             if (c2 == '[') {
                 int c3 = getchar();
-                // Left
-                if (c3 == 'D' && pos > 0) {
-                    do { pos--; } while (pos > 0 && ((input[pos] & 0xC0) == 0x80));
-                    printf("\033[1D");
-                    fflush(stdout);
-                }
-                // Right
-                else if (c3 == 'C' && pos < len) {
-                    size_t next = pos+1;
-                    while (next < len && (input[next] & 0xC0) == 0x80) ++next;
-                    if (next <= len) {
-                        printf("\033[1C");
-                        pos = next;
-                        fflush(stdout);
+                if (!mask) {
+                    // Left
+                    if (c3 == 'D' && pos > 0) {
+                        do { pos--; } while (pos > 0 && ((input[pos] & 0xC0) == 0x80));
+                        printf("\033[1D"); fflush(stdout);
                     }
-                }
-                // Delete key: ESC [ 3 ~
-                else if (c3 == '3') {
-                    int c4 = getchar(); // should be '~'
-                    if (c4 == '~' && pos < len) {
-                        // Delete char at cursor
-                        size_t delbytes = 1;
-                        if ((input[pos] & 0xE0) == 0xC0) delbytes = 2;
-                        else if ((input[pos] & 0xF0) == 0xE0) delbytes = 3;
-                        else if ((input[pos] & 0xF8) == 0xF0) delbytes = 4;
-                        memmove(&input[pos], &input[pos + delbytes], len - pos - delbytes + 1);
-                        len -= delbytes;
-                        printf("\033[s");
-                        for (size_t i = pos; i < len;) {
-                            if (mask) putchar('*');
-                            else {
+                    // Right
+                    else if (c3 == 'C' && pos < len) {
+                        size_t next = pos+1;
+                        while (next < len && (input[next] & 0xC0) == 0x80) ++next;
+                        if (next <= len) {
+                            printf("\033[1C"); fflush(stdout);
+                            pos = next;
+                        }
+                    }
+                    // Delete: ESC [ 3 ~
+                    else if (c3 == '3') {
+                        (void)getchar(); // '~'
+                        if (pos < len) {
+                            size_t delbytes = 1;
+                            if ((input[pos] & 0xE0) == 0xC0) delbytes = 2;
+                            else if ((input[pos] & 0xF0) == 0xE0) delbytes = 3;
+                            else if ((input[pos] & 0xF8) == 0xF0) delbytes = 4;
+                            memmove(&input[pos], &input[pos + delbytes], len - pos - delbytes + 1);
+                            len -= delbytes;
+                            // Redraw after cursor
+                            printf("\033[s");
+                            for (size_t i = pos; i < len;) {
                                 int clen = 1;
                                 if ((input[i] & 0xE0) == 0xC0) clen = 2;
                                 else if ((input[i] & 0xF0) == 0xE0) clen = 3;
                                 else if ((input[i] & 0xF8) == 0xF0) clen = 4;
                                 fwrite(&input[i], 1, clen, stdout);
+                                i += clen;
                             }
-                            size_t step = 1;
-                            if ((input[i] & 0xE0) == 0xC0) step = 2;
-                            else if ((input[i] & 0xF0) == 0xE0) step = 3;
-                            else if ((input[i] & 0xF8) == 0xF0) step = 4;
-                            i += step;
+                            putchar(' ');
+                            printf("\033[u");
+                            fflush(stdout);
                         }
-                        putchar(' ');
-                        printf("\033[u");
-                        fflush(stdout);
                     }
                 }
                 continue;
@@ -150,55 +167,15 @@ size_t read_line(const char *prompt, unsigned char *buf, size_t maxlen, int mask
 
         // Backspace (127 or 8)
         if ((c == 127 || c == 8)) {
-            if (pos == 0) continue; // do nothing at leftmost
+            if (pos == 0) continue;
             size_t orig = pos;
             do { pos--; } while (pos > 0 && ((input[pos] & 0xC0) == 0x80));
+            size_t bwidth = orig - pos;
             memmove(&input[pos], &input[orig], len - orig + 1);
-            len -= orig - pos;
+            len -= bwidth;
             num_chars--;
-            printf("\033[1D\033[s");
-            for (size_t i = pos; i < len;) {
-                if (mask) putchar('*');
-                else {
-                    int clen = 1;
-                    if ((input[i] & 0xE0) == 0xC0) clen = 2;
-                    else if ((input[i] & 0xF0) == 0xE0) clen = 3;
-                    else if ((input[i] & 0xF8) == 0xF0) clen = 4;
-                    fwrite(&input[i], 1, clen, stdout);
-                }
-                size_t step = 1;
-                if ((input[i] & 0xE0) == 0xC0) step = 2;
-                else if ((input[i] & 0xF0) == 0xE0) step = 3;
-                else if ((input[i] & 0xF8) == 0xF0) step = 4;
-                i += step;
-            }
-            putchar(' ');
-            printf("\033[u");
-            fflush(stdout);
-            continue;
-        }
-
-        // Insert char
-        if ((unsigned char)c >= 32 && len + 4 < maxlen) {
-            int cbytes = 1;
-            if ((c & 0xE0) == 0xC0) cbytes = 2;
-            else if ((c & 0xF0) == 0xE0) cbytes = 3;
-            else if ((c & 0xF8) == 0xF0) cbytes = 4;
-            if (len + cbytes >= maxlen) continue;
-            input[len++] = c;
-            for (int k = 1; k < cbytes; ++k)
-                input[len++] = getchar();
-            printf("\033[s");
-            if (mask) {
-                for (size_t i = pos; i < len;) {
-                    putchar('*');
-                    size_t step = 1;
-                    if ((input[i] & 0xE0) == 0xC0) step = 2;
-                    else if ((input[i] & 0xF0) == 0xE0) step = 3;
-                    else if ((input[i] & 0xF8) == 0xF0) step = 4;
-                    i += step;
-                }
-            } else {
+            if (!mask) {
+                printf("\033[1D\033[s");
                 for (size_t i = pos; i < len;) {
                     int clen = 1;
                     if ((input[i] & 0xE0) == 0xC0) clen = 2;
@@ -207,22 +184,53 @@ size_t read_line(const char *prompt, unsigned char *buf, size_t maxlen, int mask
                     fwrite(&input[i], 1, clen, stdout);
                     i += clen;
                 }
+                putchar(' ');
+                printf("\033[u");
+                fflush(stdout);
             }
-            putchar(' ');
-            printf("\033[u");
-            printf("\033[1C");
-            fflush(stdout);
-            pos = len;
+            continue;
+        }
+
+        // Insert char at position
+        if ((unsigned char)c >= 32 && len + 4 < maxlen) {
+            int cbytes = 1;
+            if ((c & 0xE0) == 0xC0) cbytes = 2;
+            else if ((c & 0xF0) == 0xE0) cbytes = 3;
+            else if ((c & 0xF8) == 0xF0) cbytes = 4;
+            if (len + cbytes >= maxlen) continue;
+            // move everything after cursor forward
+            memmove(&input[pos + cbytes], &input[pos], len - pos + 1);
+            input[pos] = c;
+            for (int k = 1; k < cbytes; ++k)
+                input[pos + k] = getchar();
+            len += cbytes;
+            if (!mask) {
+                // Redraw everything after cursor
+                printf("\033[s");
+                for (size_t i = pos; i < len;) {
+                    int clen = 1;
+                    if ((input[i] & 0xE0) == 0xC0) clen = 2;
+                    else if ((input[i] & 0xF0) == 0xE0) clen = 3;
+                    else if ((input[i] & 0xF8) == 0xF0) clen = 4;
+                    fwrite(&input[i], 1, clen, stdout);
+                    i += clen;
+                }
+                putchar(' ');
+                printf("\033[u");
+                printf("\033[1C");
+                fflush(stdout);
+            }
+            pos += cbytes;
             num_chars++;
         }
     }
     input[len] = 0;
     tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
-    printf("\n");
+    if (!mask) printf("\n");
 
     if (len >= maxlen) {
         fprintf(stderr, "Input too long! (max %zu bytes)\n", maxlen - 1);
-        exit(1);
+        secure_bail_simple(1);
     }
     memcpy(buf, input, len);
     buf[len] = 0;
@@ -273,7 +281,7 @@ int aes256_cbc_decrypt(const unsigned char *key, const unsigned char *iv,
     ptlen = len;
     if (1 != EVP_DecryptFinal_ex(ctx, plaintext + len, &len)) {
         EVP_CIPHER_CTX_free(ctx);
-        return -1;
+        return ptlen; // partial junk as requested
     }
     ptlen += len;
     EVP_CIPHER_CTX_free(ctx);
@@ -344,6 +352,17 @@ int try_clipboard(const char *cmd, const char *text) {
     return 1;
 }
 
+void kill_old_twain_clip() {
+    pid_t pid = fork();
+    if (pid == 0) {
+        execlp("pkill", "pkill", "-9", "-x", "twain-clip", (char*)NULL);
+        _exit(0);
+    } else if (pid > 0) {
+        int status;
+        waitpid(pid, &status, 0);
+    }
+}
+
 int main() {
     setlocale(LC_ALL, "");
     ERR_load_crypto_strings();
@@ -356,15 +375,9 @@ int main() {
 
     char dirpath[1024], credsfile[1024];
     int dlen = snprintf(dirpath, sizeof(dirpath), "%s/%s", home, DIRNAME);
-    if (dlen < 0 || (size_t)dlen >= sizeof(dirpath)) {
-        fprintf(stderr, "Directory path too long!\n");
-        return 1;
-    }
+    if (dlen < 0 || (size_t)dlen >= sizeof(dirpath)) secure_bail_simple(1);
     int clen = snprintf(credsfile, sizeof(credsfile), "%s/%s", dirpath, FILENAME);
-    if (clen < 0 || (size_t)clen >= sizeof(credsfile)) {
-        fprintf(stderr, "Credentials file path too long!\n");
-        return 1;
-    }
+    if (clen < 0 || (size_t)clen >= sizeof(credsfile)) secure_bail_simple(1);
 
     unsigned char firstname[MAXNAME+1] = {0};   // 16 bytes + nul
     unsigned char passphrase[MAXPHRASE+1] = {0};
@@ -385,9 +398,15 @@ int main() {
 
         size_t ph_len = 0;
         do {
-            ph_len = read_line("Passphrase (hidden, like a second password): ", passphrase, MAXPHRASE, 1, NULL);
+            ph_len = read_line("Passphrase (this acts like a second password, and is stored encrypted on the hard disk): ", passphrase, MAXPHRASE, 1, NULL);
+            printf("\n");
+            if (ph_len < MINPHRASE) {
+                printf("Passphrase must be at least %d bytes. Try again.\n", MINPHRASE);
+                continue;
+            }
             unsigned char confirm[MAXPHRASE+1] = {0};
-            size_t ph2 = read_line("Repeat passphrase: ", confirm, MAXPHRASE, 1, NULL);
+            size_t ph2 = read_line("Passphrase (please repeat your passphrase again; we'll tell you if there is a mismatch): ", confirm, MAXPHRASE, 1, NULL);
+            printf("\n");
             if (ph_len != ph2 || memcmp(passphrase, confirm, ph_len) != 0) {
                 printf("Error: passphrases do not match. Please try again.\n");
                 continue;
@@ -397,9 +416,15 @@ int main() {
 
         size_t pw_len = 0;
         do {
-            pw_len = read_line("Master password: ", password, MAXPASS, 1, NULL);
+            pw_len = read_line("Master Password (never tell this to anyone, except a judge under court order): ", password, MAXPASS, 1, NULL);
+            printf("\n");
+            if (pw_len < MINPASS) {
+                printf("Master password must be at least %d bytes. Try again.\n", MINPASS);
+                continue;
+            }
             unsigned char confirm[MAXPASS+1] = {0};
-            size_t pw2 = read_line("Repeat master password: ", confirm, MAXPASS, 1, NULL);
+            size_t pw2 = read_line("Master Password (one more time, please; we'll tell you if there's a mismatch): ", confirm, MAXPASS, 1, NULL);
+            printf("\n");
             if (pw_len != pw2 || memcmp(password, confirm, pw_len) != 0) {
                 printf("Error: passwords do not match. Please try again.\n");
                 continue;
@@ -407,8 +432,16 @@ int main() {
             break;
         } while (1);
 
-        printf("Deriving pepper. This may take 10-30 seconds on modern CPUs. On some older systems, it can take a minute or two.\n"
-               "Please wait, expensive cryptography in progress...\n");
+        printf("\n");
+        printf("We're now deriving a pepper from your passphrase.\n");
+        printf("This pepper then encrypted with your password, and stored on the hard disk.\n");   
+        printf("This may take 10-30 seconds on modern CPUs. On some older systems, it can take a minute or two.\n");
+        printf("REMARKS\n");
+        printf("| Your password is never stored.\n");
+        printf("| You need to remember both your password and your passphrase.\n");
+        printf("| Your password cannot be recovered if you forget it.\n");
+        printf("| Technically, your passphrase can be recovered as long as you remember the password, and avoid logging out.\n");
+        printf("| Nevertheless, you should act like it cannot be recovered.\n");
 
         unsigned char fname_salt[MAXNAME] = {0}; memcpy(fname_salt, firstname, fn_len);
 
@@ -427,9 +460,7 @@ int main() {
             "derive pepper"
         );
         if (rc != ARGON2_OK) {
-            secure_memzero(password, sizeof(password));
-            secure_memzero(passphrase, sizeof(passphrase));
-            return 2;
+            secure_bail(2, password, sizeof(password), passphrase, sizeof(passphrase), NULL,0, NULL,0, NULL,0);
         }}
 
         memcpy(pepper, PEPPER_MAGIC, PEPPER_MAGIC_LEN);
@@ -444,9 +475,7 @@ int main() {
             "derive secret"
         );
         if (rc != ARGON2_OK) {
-            secure_memzero(password, sizeof(password));
-            secure_memzero(secret, sizeof(secret));
-            return 2;
+            secure_bail(2, password, sizeof(password), passphrase, sizeof(passphrase), secret, sizeof(secret), NULL,0, NULL,0);
         }}
 
         memcpy(aes_iv, fname_salt, AES_IVLEN);
@@ -456,29 +485,26 @@ int main() {
         if (ciphlen < 0) {
             fprintf(stderr, "AES encryption failed.\n");
             ERR_print_errors_fp(stderr);
-            return 2;
+            secure_bail(2, password, sizeof(password), passphrase, sizeof(passphrase), secret, sizeof(secret), pepper, sizeof(pepper), NULL,0);
         }
 
-        if (ensure_twain_dir(dirpath) != 0) return 2;
+        if (ensure_twain_dir(dirpath) != 0) secure_bail_simple(2);
         umask(0077);
 
         cf = fopen(credsfile, "wb");
-        if (!cf) { fprintf(stderr, "Failed to save %s\n", credsfile); return 2; }
-        if (fwrite(firstname, 1, fn_len, cf) != fn_len || // Write without padding, but with EOL after
+        if (!cf) { fprintf(stderr, "Failed to save %s\n", credsfile); secure_bail_simple(2);}
+        if (fwrite(firstname, 1, fn_len, cf) != fn_len ||
             fputc('\n', cf) == EOF ||
             fwrite(ciphertext, 1, ciphlen, cf) != (size_t)ciphlen) {
             fprintf(stderr, "Failed to write credentials file.\n");
             fclose(cf);
-            return 2;
+            secure_bail_simple(2);
         }
         fclose(cf);
 
-        printf("Thanks! Your credentials are now stored (encrypted) in %s\n", credsfile);
-        secure_memzero(secret, sizeof(secret));
-        secure_memzero(pepper, sizeof(pepper));
-        secure_memzero(password, sizeof(password));
-        secure_memzero(passphrase, sizeof(passphrase));
-        return 0;
+        printf("\n");
+        printf("Your first name (in plaintext) and pepper (in encrypted form) are now stored at %s\n", credsfile);
+        secure_bail(0, secret, sizeof(secret), pepper, sizeof(pepper), password, sizeof(password), passphrase, sizeof(passphrase), NULL,0);
     }
 
     // --- Main workflow ---
@@ -487,7 +513,7 @@ int main() {
     if (!fgets((char*)fname_file, sizeof(fname_file), cf)) {
         fprintf(stderr, "Failed to read first name from credentials file.\n");
         fclose(cf);
-        return 2;
+        secure_bail_simple(2);
     }
     fn_len = strcspn((char*)fname_file, "\r\n");
     unsigned char fname_salt[MAXNAME] = {0};
@@ -520,10 +546,14 @@ int main() {
             printf("Credentials securely deleted. Bye!\n");
         else
             perror("Failed to delete credentials file");
-        return 0;
+        secure_bail_simple(0);
     }
 
     size_t pw_len = read_line("Master password: ", password, MAXPASS, 1, NULL);
+    if (pw_len < MINPASS) {
+        printf("Master password must be at least %d bytes. Aborting.\n", MINPASS);
+        secure_bail(2, password, sizeof(password), secret, sizeof(secret), NULL,0, NULL,0, NULL,0);
+    }
 
     { int rc = argon2id_hash_raw_params(
         ARGON2_T_COST_NORMAL, ARGON2_M_COST, ARGON2_P_COST,
@@ -533,39 +563,42 @@ int main() {
         "derive secret"
     );
     if (rc != ARGON2_OK) {
-        memset(password, 0, sizeof(password));
-        memset(secret, 0, sizeof(secret));
-        return 2;
+        secure_bail(2, password, sizeof(password), secret, sizeof(secret), NULL,0, NULL,0, NULL,0);
     }}
 
     decrypted_len = aes256_cbc_decrypt(secret, aes_iv, ciphertext, ciphertext_len, pepper_decrypted);
-    if (decrypted_len != PEPPER_LEN || memcmp(pepper_decrypted, PEPPER_MAGIC, PEPPER_MAGIC_LEN) != 0) {
-        printf("| WARNING: Could not verify master password. Output is still deterministic.\n");
-    }
+    if (decrypted_len < 0) decrypted_len = 0;
 
-    // Generate output password: Argon2id(salt=fname_salt, msg=service||DELIM||pepper, normal)
-    unsigned char out_input[sizeof(service)+sizeof(DELIM)+PEPPER_LEN] = {0};
+    if (!(decrypted_len == PEPPER_LEN && memcmp(pepper_decrypted, PEPPER_MAGIC, PEPPER_MAGIC_LEN) == 0))
+        printf("| WARNING: Could not verify master password. Output is still deterministic.\n");
+
+    // --- Compute FINAL PASSWORD using SHA3 ---
+    unsigned char out_input[HASHLEN + sizeof(DELIM) + PEPPER_LEN + sizeof(DELIM) + 128] = {0};
     size_t off = 0;
-    memcpy(out_input, service, service_len); off += service_len;
+    memcpy(out_input, secret, HASHLEN); off += HASHLEN;
     memcpy(out_input+off, DELIM, sizeof(DELIM)-1); off += sizeof(DELIM)-1;
     memcpy(out_input+off, pepper_decrypted, decrypted_len); off += decrypted_len;
+    memcpy(out_input+off, DELIM, sizeof(DELIM)-1); off += sizeof(DELIM)-1;
+    memcpy(out_input+off, service, service_len); off += service_len;
 
+    // SHA3-256 with salt: hash( salt || msg )
+    EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
     unsigned char out_hash[HASHLEN] = {0};
-    { int rc = argon2id_hash_raw_params(
-        ARGON2_T_COST_NORMAL, ARGON2_M_COST, ARGON2_P_COST,
-        out_input, off,
-        fname_salt, MAXNAME,
-        out_hash, HASHLEN,
-        "final password derive"
-    );
-    if (rc != ARGON2_OK) {
-        memset(secret, 0, sizeof(secret));
-        memset(password, 0, sizeof(password));
-        return 2;
-    }}
+    if (!mdctx || 1 != EVP_DigestInit_ex(mdctx, EVP_sha3_256(), NULL) ||
+        1 != EVP_DigestUpdate(mdctx, fname_salt, MAXNAME) ||
+        1 != EVP_DigestUpdate(mdctx, out_input, off) ||
+        1 != EVP_DigestFinal_ex(mdctx, out_hash, NULL)) {
+        fprintf(stderr, "SHA3 hash error!\n");
+        EVP_MD_CTX_free(mdctx);
+        secure_bail(2, password, sizeof(password), secret, sizeof(secret), pepper_decrypted, sizeof(pepper_decrypted), NULL,0, NULL,0);
+    }
+    EVP_MD_CTX_free(mdctx);
 
     char outpw[FINALPWLEN+1] = {0};
     base36_tailN(out_hash, outpw, FINALPWLEN);
+
+    // ---- KILL all twain-clip ----
+    kill_old_twain_clip();
 
     int copied = 0;
     copied = try_clipboard("xclip -selection clipboard 2>/dev/null", outpw);
@@ -577,32 +610,23 @@ int main() {
     // Spawn clipboard clearer (twain-clip) if copy succeeded
     if (copied) {
         printf("Password copied to clipboard!\n");
-
-        // Fork and exec twain-clip with the password as argument
+        printf("If it's still lurking in the clipboard in 15 seconds, we'll clear the clipboard.\n");
         pid_t pid = fork();
         if (pid == 0) {
-            // In child process
-            char *argv[3] = {"twain-clip", outpw, NULL};
+            char *argv[3];
+            argv[0] = (char*)"twain-clip";
+            argv[1] = (char*)outpw;
+            argv[2] = NULL;
             execvp("twain-clip", argv);
-            printf("If it's still lurking in the clipboard in 15 seconds, we'll clear the clipboard.\n");
-
-            _exit(0);
-        } else {
-            printf("There was an issue spawning the process that's meant to clear the clipboard after 15 seconds.\n");
+            _exit(1);
         }
     } else {
+        printf("There was an issue spawning the process that's meant to clear the clipboard after 15 seconds.\n");
         printf("Could not copy password to clipboard.\n");
         printf("Please install xclip, xsel, or wl-clipboard to enable clipboard copy.\n");
         printf("For your security, TwainPass will never print your password to the terminal.\n");
     }
 
-    secure_memzero(secret, sizeof(secret));
-    secure_memzero(password, sizeof(password));
-    secure_memzero(pepper_decrypted, sizeof(pepper_decrypted));
-    secure_memzero(out_hash, sizeof(out_hash));
-    secure_memzero(outpw, sizeof(outpw));
-    secure_memzero(service, sizeof(service));
-    secure_memzero(fname_salt, sizeof(fname_salt));
-
+    secure_bail(0, secret, sizeof(secret), password, sizeof(password), pepper_decrypted, sizeof(pepper_decrypted), (unsigned char*)out_hash, sizeof(out_hash), (unsigned char*)outpw, sizeof(outpw));
     return 0;
 }
