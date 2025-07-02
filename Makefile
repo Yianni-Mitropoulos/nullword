@@ -1,6 +1,6 @@
 CC      := gcc
 CFLAGS  := -O2 -Wall -Wextra -Werror -fstack-protector-strong -D_FORTIFY_SOURCE=2 -fPIE -pie
-LDFLAGS := -largon2 -Wl,-z,relro,-z,now
+LDFLAGS := -largon2 -lssl -lcrypto -Wl,-z,relro,-z,now
 BIN     := nullword
 SRC     := nullword.c
 
