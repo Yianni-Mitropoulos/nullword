@@ -504,6 +504,7 @@ int main() {
 
         printf("\n");
         printf("Your first name (in plaintext) and pepper (in encrypted form) are now stored at %s\n", credsfile);
+        printf("Never tell your password or passphrase to anyone, except under court order.");
         secure_bail(0, secret, sizeof(secret), pepper, sizeof(pepper), password, sizeof(password), passphrase, sizeof(passphrase), NULL,0);
     }
 
